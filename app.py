@@ -1,113 +1,82 @@
-import logging
-from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import sqlite3
-import qrcode
 import os
+import logging
+import qrcode
 import asyncio
+from flask import Flask
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
-import threading
-
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+import psycopg2  # Changed from SQLite to PostgreSQL
 
 load_dotenv()
 
 app = Flask(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Initialize database
-def init_db():
-    with sqlite3.connect('car_owners.db') as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS owners 
-                    (qr_id TEXT PRIMARY KEY, chat_id INTEGER)''')
-        conn.commit()
-init_db()
+# PostgreSQL setup
+conn = psycopg2.connect(DATABASE_URL)
+with conn.cursor() as cur:
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS owners (
+            qr_id TEXT PRIMARY KEY,
+            chat_id INTEGER
+        )
+    ''')
+conn.commit()
+
+# Telegram bot setup
+bot = Bot(token=TOKEN)
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.message.chat_id
-        if not context.args:
-            await update.message.reply_text("Usage: /register <QR_CODE_ID>")
-            return
-
         qr_id = context.args[0]
         
-        with sqlite3.connect('car_owners.db') as conn:
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO owners VALUES (?, ?)", (qr_id, chat_id))
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO owners (qr_id, chat_id)
+                VALUES (%s, %s)
+                ON CONFLICT (qr_id) DO UPDATE
+                SET chat_id = EXCLUDED.chat_id
+            ''', (qr_id, chat_id))
             conn.commit()
         
-        url = f"http://localhost:5000/alert/{qr_id}"
+        # Generate QR with Render URL
+        url = f"{os.getenv('RENDER_EXTERNAL_URL')}/alert/{qr_id}"
         img = qrcode.make(url)
-        qr_path = f"qr_codes/{qr_id}.png"
-        img.save(qr_path)
+        img.save(f"{qr_id}.png")
         
-        with open(qr_path, 'rb') as qr_file:
-            await update.message.reply_photo(
-                photo=qr_file,
-                caption=f"✅ Registered QR: {qr_id}"
-            )
-        
-        os.remove(qr_path)
+        await update.message.reply_photo(
+            photo=open(f"{qr_id}.png", 'rb'),
+            caption=f"✅ Registered QR: {qr_id}"
+        )
+        os.remove(f"{qr_id}.png")
         
     except Exception as e:
         logging.error(f"Error: {e}")
-        await update.message.reply_text("⚠️ Operation failed. Please try again.")
 
 @app.route('/alert/<qr_id>')
-def alert_owner(qr_id):
+def alert(qr_id):
     try:
-        with sqlite3.connect('car_owners.db') as conn:
-            c = conn.cursor()
-            c.execute("SELECT chat_id FROM owners WHERE qr_id=?", (qr_id,))
-            result = c.fetchone()
-            chat_id = result[0] if result else None
-
-        if not chat_id:
-            return "QR code not registered", 404
-
-        async def send_alert():
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text="🚨 Please move your car!"
-            )
-        asyncio.run(send_alert())
-        return "Notification sent", 200
-
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        return "Notification failed", 500
-
-@app.route('/')
-def home():
-    return "Car Alert System - Use /register in Telegram"
+        with conn.cursor() as cur:
+            cur.execute("SELECT chat_id FROM owners WHERE qr_id = %s", (qr_id,))
+            chat_id = cur.fetchone()[0]
+            
+            async def send_alert():
+                await bot.send_message(chat_id, "🚨 Please move your car!")
+            
+            asyncio.run(send_alert())
+            return "Alert sent!"
+    except:
+        return "QR not registered"
 
 def run_bot():
-    global application
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .job_queue(None)  # Disable job queue
-        .build()
-    )
+    application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("register", register))
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(application.run_polling())
+    application.run_polling()
 
 if __name__ == '__main__':
-    os.makedirs("qr_codes", exist_ok=True)
-    
-    # Start bot in separate thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Start Flask
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    import threading
+    threading.Thread(target=run_bot, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
