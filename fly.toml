@@ -1,0 +1,8 @@
+app = "Car-Alert"
+primary_region = "iad"
+
+[http_service]
+  internal_port = 5000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
