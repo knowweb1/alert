@@ -1,29 +1,32 @@
-import os
+# app.py
 import logging
+import sqlite3
 import qrcode
+import os
 import asyncio
 from flask import Flask
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
-import psycopg2  # Changed from SQLite to PostgreSQL
+import threading
 
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# Load environment variables first!
 load_dotenv()
 
 app = Flask(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DOMAIN = os.getenv("PYTHONANYWHERE_DOMAIN", "tahaafifi08.pythonanywhere.com")
 
-# PostgreSQL setup
-conn = psycopg2.connect(DATABASE_URL)
-with conn.cursor() as cur:
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS owners (
-            qr_id TEXT PRIMARY KEY,
-            chat_id INTEGER
-        )
-    ''')
-conn.commit()
+# Database setup
+conn = sqlite3.connect('car_owners.db', check_same_thread=False)
+conn.execute('''CREATE TABLE IF NOT EXISTS owners
+             (qr_id TEXT PRIMARY KEY, chat_id INTEGER)''')
 
 # Telegram bot setup
 bot = Bot(token=TOKEN)
@@ -31,19 +34,18 @@ bot = Bot(token=TOKEN)
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.message.chat_id
+        if not context.args:
+            await update.message.reply_text("Usage: /register <QR_CODE_ID>")
+            return
+
         qr_id = context.args[0]
         
-        with conn.cursor() as cur:
-            cur.execute('''
-                INSERT INTO owners (qr_id, chat_id)
-                VALUES (%s, %s)
-                ON CONFLICT (qr_id) DO UPDATE
-                SET chat_id = EXCLUDED.chat_id
-            ''', (qr_id, chat_id))
-            conn.commit()
+        # Save to database
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO owners VALUES (?, ?)", (qr_id, chat_id))
         
-        # Generate QR with Render URL
-        url = f"{os.getenv('RENDER_EXTERNAL_URL')}/alert/{qr_id}"
+        # Generate QR code
+        url = f"https://{DOMAIN}/alert/{qr_id}"
         img = qrcode.make(url)
         img.save(f"{qr_id}.png")
         
@@ -55,28 +57,42 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logging.error(f"Error: {e}")
+        await update.message.reply_text("⚠️ Error! Usage: /register <QR_ID>")
+
+@app.route('/')
+def home():
+    return "Car Alert System - Use /register in Telegram"
 
 @app.route('/alert/<qr_id>')
-def alert(qr_id):
+def send_alert(qr_id):
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT chat_id FROM owners WHERE qr_id = %s", (qr_id,))
-            chat_id = cur.fetchone()[0]
-            
-            async def send_alert():
-                await bot.send_message(chat_id, "🚨 Please move your car!")
-            
-            asyncio.run(send_alert())
-            return "Alert sent!"
+        cur = conn.cursor()
+        cur.execute("SELECT chat_id FROM owners WHERE qr_id=?", (qr_id,))
+        chat_id = cur.fetchone()[0]
+        
+        # Create new event loop for Flask thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
+            bot.send_message(chat_id, "🚨 Please move your car!")
+        )
+        return "Alert sent!", 200
     except:
-        return "QR not registered"
+        return "QR code not registered", 404
 
 def run_bot():
+    # Create separate event loop for bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("register", register))
-    application.run_polling()
+    
+    loop.run_until_complete(application.run_polling())
 
 if __name__ == '__main__':
-    import threading
+    # Start bot in daemon thread
     threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    
+    # Start Flask
+    app.run(host='0.0.0.0', port=5000)
