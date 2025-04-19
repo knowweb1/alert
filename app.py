@@ -1,5 +1,5 @@
 import logging
-from flask import Flask, request
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import sqlite3
@@ -8,6 +8,7 @@ import os
 import asyncio
 from dotenv import load_dotenv
 import threading
+from threading import Lock
 
 # Configure logging
 logging.basicConfig(
@@ -20,13 +21,16 @@ load_dotenv()
 app = Flask(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+# Global variables
+application = None
+loop = None
+lock = Lock()
+
 # Initialize database
 def init_db():
     with sqlite3.connect('car_owners.db') as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS owners 
-                    (qr_id TEXT PRIMARY KEY, chat_id INTEGER)''')
-        conn.commit()
+        conn.execute('''CREATE TABLE IF NOT EXISTS owners 
+                      (qr_id TEXT PRIMARY KEY, chat_id INTEGER)''')
 init_db()
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -39,9 +43,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qr_id = context.args[0]
         
         with sqlite3.connect('car_owners.db') as conn:
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO owners VALUES (?, ?)", (qr_id, chat_id))
-            conn.commit()
+            conn.execute("INSERT OR REPLACE INTO owners VALUES (?, ?)", (qr_id, chat_id))
         
         url = f"http://localhost:5000/alert/{qr_id}"
         img = qrcode.make(url)
@@ -49,10 +51,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         img.save(qr_path)
         
         with open(qr_path, 'rb') as qr_file:
-            await update.message.reply_photo(
-                photo=qr_file,
-                caption=f"✅ Registered QR: {qr_id}"
-            )
+            await update.message.reply_photo(qr_file, caption=f"✅ Registered QR: {qr_id}")
         
         os.remove(qr_path)
         
@@ -64,20 +63,24 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def alert_owner(qr_id):
     try:
         with sqlite3.connect('car_owners.db') as conn:
-            c = conn.cursor()
-            c.execute("SELECT chat_id FROM owners WHERE qr_id=?", (qr_id,))
-            result = c.fetchone()
+            cur = conn.execute("SELECT chat_id FROM owners WHERE qr_id=?", (qr_id,))
+            result = cur.fetchone()
             chat_id = result[0] if result else None
 
         if not chat_id:
             return "QR code not registered", 404
 
-        async def send_alert():
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text="🚨 Please move your car!"
+        # Use thread-safe async execution
+        with lock:
+            future = asyncio.run_coroutine_threadsafe(
+                application.bot.send_message(
+                    chat_id=chat_id,
+                    text="🚨 Please move your car!"
+                ),
+                loop
             )
-        asyncio.run(send_alert())
+            future.result(timeout=10)  # Wait for completion
+        
         return "Notification sent", 200
 
     except Exception as e:
@@ -89,13 +92,8 @@ def home():
     return "Car Alert System - Use /register in Telegram"
 
 def run_bot():
-    global application
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .job_queue(None)  # Disable job queue
-        .build()
-    )
+    global application, loop
+    application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("register", register))
     
     loop = asyncio.new_event_loop()
